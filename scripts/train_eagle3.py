@@ -1118,16 +1118,28 @@ def main():
                 eval_plosses = [[] for _ in range(eagle3_model.length)]
 
                 for data in tqdm(eval_dataloader, desc=f"Evaluating Epoch {epoch}"):
-                    with torch.no_grad():
-                        plosses, acces = run_forward(
-                            args, eagle3_model, data, target_model, is_online
-                        )
-                        eval_acces = [
-                            eval_acces[i] + [acces[i]] for i in range(len(acces))
-                        ]
-                        eval_plosses = [
-                            eval_plosses[i] + [plosses[i]] for i in range(len(plosses))
-                        ]
+                    if args.use_dynamic_length_training:
+                        with torch.no_grad():
+                            plosses, acces, _ = run_forward_dynamic_length(
+                                args, eagle3_model, data, target_model, is_online
+                            )
+                            eval_acces = [
+                                eval_acces[i] + [acces[i]] for i in range(len(acces))
+                            ]
+                            eval_plosses = [
+                                eval_plosses[i] + [plosses[i]] for i in range(len(plosses))
+                            ]
+                    else:
+                        with torch.no_grad():
+                            plosses, acces = run_forward(
+                                args, eagle3_model, data, target_model, is_online
+                            )
+                            eval_acces = [
+                                eval_acces[i] + [acces[i]] for i in range(len(acces))
+                            ]
+                            eval_plosses = [
+                                eval_plosses[i] + [plosses[i]] for i in range(len(plosses))
+                            ]
 
                 # compute average over all minibatches
                 eval_acces = [torch.stack(acc).mean() for acc in eval_acces]
