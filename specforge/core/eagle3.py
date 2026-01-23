@@ -89,6 +89,38 @@ class OnlineEagle3Model(Eagle3Model):
         ).clone()
         return shared_input
 
+    def fix_target_p(
+        target_p: torch.Tensor,          # [B, S, V]
+        dynamic_lengths: torch.Tensor,   # [B, S]
+        idx: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Apply <IDK> training rule.
+
+        Returns:
+            fixed_target_p: [B, S, V+1]
+            dynamic_position_mask: [B, S] (0/1)
+        """
+        B, S, V = target_p.shape
+        device = target_p.device
+
+        idk_col = torch.zeros((B, S, 1), device=device, dtype=target_p.dtype)
+        target_p = torch.cat([target_p, idk_col], dim=-1)  # [B, S, V+1]
+
+        idx_tensor = torch.full_like(dynamic_lengths, idx)
+
+        lt_mask = idx_tensor < dynamic_lengths     # idx < dyn_len
+        eq_mask = idx_tensor == dynamic_lengths    # idx == dyn_len
+        gt_mask = idx_tensor > dynamic_lengths     # idx > dyn_len
+
+        if eq_mask.any():
+            target_p[eq_mask] = 0.0
+            target_p[eq_mask, -1] = 1.0
+
+        dynamic_position_mask = (~gt_mask).int()  # 1 keeps, 0 drops
+
+        return target_p, dynamic_position_mask
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -118,6 +150,8 @@ class OnlineEagle3Model(Eagle3Model):
             length=self.length,
         )
         del target
+        dynamic_lengths = kwargs.get("dynamic_lengths", None)
+        use_idk = dynamic_lengths is not None
 
         # basic info
         batch_size, seq_length, _ = hidden_states.shape
@@ -180,6 +214,26 @@ class OnlineEagle3Model(Eagle3Model):
 
         for idx in range(self.length):
             target_p = target_p_padded[:, idx : idx + seq_length, :]
+
+            if use_idk:
+                # dynamic_lengths: [B, S]
+                target_p, dynamic_position_mask = fix_target_p(
+                    target_p=target_p,
+                    dynamic_lengths=dynamic_lengths,
+                    idx=idx,
+                )
+
+                # combine with original position_mask
+                position_mask = position_mask * dynamic_position_mask
+            else:
+                # no IDK → still need to pad IDK column for lm_head
+                idk_col = torch.zeros(
+                    (*target_p.shape[:2], 1),
+                    device=target_p.device,
+                    dtype=target_p.dtype,
+                )
+                target_p = torch.cat([target_p, idk_col], dim=-1)
+
             if self.attention_backend == "usp":
                 input_ids = self.prepare_usp_input(global_input_ids)
             else:

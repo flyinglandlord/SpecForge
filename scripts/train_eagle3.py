@@ -40,6 +40,7 @@ from specforge.distributed import (
     init_distributed,
 )
 from specforge.modeling.target import (
+    SGLangEagle3TargetModel,
     Eagle3TargetModel,
     TargetHead,
     get_eagle3_target_model,
@@ -165,6 +166,17 @@ def parse_args() -> Tuple[ArgumentParser, Namespace]:
     )
     training_group.add_argument("--seed", type=int, default=0)
     training_group.add_argument("--draft-accumulation-steps", type=int, default=1)
+    training_group.add_argument(
+        "--use-dynamic-length-training",
+        action="store_true",
+        help="Use dynamic stopping mechanism training with <IDK> token",
+    )
+    training_group.add_argument(
+        "--idk-token",
+        type=str,
+        default="<IDK>",
+        help="Special token to indicate uncertainty (used in dynamic training)",
+    )
 
     # data processing type
     optimization_group = parser.add_argument_group("optimization")
@@ -391,6 +403,10 @@ def build_draft_model(args: Namespace) -> Tuple[AutoDraftModelConfig, nn.Module]
 
     draft_model.load_embedding(args.target_model_path, embedding_key=args.embedding_key)
     draft_model.freeze_embedding()
+
+    if args.use_dynamic_length_training:
+        setup_idk_token(args, draft_model)
+
     return draft_model_config, draft_model
 
 
@@ -539,6 +555,163 @@ def save_checkpoints(
             print_on_rank0(f"Saved model configuration to {epoch_output_dir}")
         dist.barrier()
 
+
+def run_forward_dynamic_length(
+    args: Namespace,
+    eagle3_model: nn.Module,
+    data: dict,
+    target_model: Eagle3TargetModel,
+    is_online: bool = True,
+) -> Tuple[List[torch.Tensor], List[torch.Tensor], int]:
+    """
+    Dynamic-length forward:
+    - Use target model to compute dynamic_length
+    - Pass dynamic_length into eagle3_model via kwargs
+    - Do NOT modify ground truth / loss mask
+    """
+
+    assert is_online, "run_forward_dynamic_length only supports online mode"
+
+    input_ids = data["input_ids"].cuda()
+    attention_mask = data["attention_mask"].cuda()
+    loss_mask = data["loss_mask"].cuda()
+
+    B, T = input_ids.shape
+
+    # ============================================================
+    # 1. Target model forward to get logits
+    # ============================================================
+    with torch.no_grad():
+        if isinstance(target_model, SGLangEagle3TargetModel):
+            _, logits_list, _, _ = (
+                target_model.extend(
+                    input_ids,
+                    attention_mask,
+                    loss_mask,
+                    return_last_hidden_states=False,
+                    return_logits=True,
+                )
+            )
+            logits = torch.stack(
+                [logit for logit in logits_list], dim=0) # [B, T, V]
+        else:
+            outputs = target_model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                return_dict=True,
+            )
+            logits = outputs.logits  # [B, T, V]
+    # print(f"{type(logits)} Logits: {logits.shape}")
+
+    # ============================================================
+    # 2. Compute top-1 predictions
+    # ============================================================
+    top1_ids = logits.argmax(dim=-1)  # [B, T]
+    # print(f"top1_ids: {top1_ids.shape}")
+
+    # ============================================================
+    # 3. Compute dynamic length per sample
+    #    连续 top1 == GT 的 token 个数
+    # ============================================================
+
+    # Decode一下每一次的top1预测，同时也decode一下数据集的input_id，比较一下
+    # tokenizer = AutoTokenizer.from_pretrained(args.target_model_path)
+    # print("Sample top1 vs GT comparison:")
+    # for i in range(min(2, B)):
+    #     top1_decoded = tokenizer.decode(
+    #         top1_ids[i, :].cpu().numpy(), skip_special_tokens=True
+    #     )
+    #     gt_decoded = tokenizer.decode(
+    #         input_ids[i, :].cpu().numpy(), skip_special_tokens=True
+    #     )
+    #     print(f"Top1  : {top1_decoded}")
+    #     print(f"GT    : {gt_decoded}")
+
+    dyn_lengths = []
+
+    # for b in range(B):
+    #     per_pos_lengths = []
+    #     for t in range(T):
+    #         if loss_mask[b, t] == 0 or t >= T - 1:
+    #             per_pos_lengths.append(0)
+    #             continue
+    #         cur_len = 0
+    #         # k 表示预测 input_ids[k+1] 的位置
+    #         for k in range(t, T - 1):
+    #             # 当前预测位置不参与 loss
+    #             if loss_mask[b, k] == 0:
+    #                 break
+    #             # 被预测的 next token 不参与 loss（可选但推荐）
+    #             if loss_mask[b, k + 1] == 0:
+    #                 break
+    #             # top-1 是否命中下一个 token
+    #             if top1_ids[b, k] == input_ids[b, k + 1]:
+    #                 cur_len += 1
+    #             else:
+    #                 break
+    #         per_pos_lengths.append(cur_len)
+    #     dyn_lengths.append(per_pos_lengths)
+
+    # Vectorized implementation
+    B, T = input_ids.shape
+    device = input_ids.device
+    top1_ids = top1_ids.to(device)
+
+    # correctness mask: [B, T-1]
+    correct = (
+        (top1_ids[:, :-1] == input_ids[:, 1:]) &
+        (loss_mask[:, :-1].bool()) &
+        (loss_mask[:, 1:].bool())
+    )
+
+    dyn_lengths = torch.zeros((B, T), device=device, dtype=torch.long)
+
+    dp = torch.zeros((B,), device=device, dtype=torch.long)
+
+    for k in range(T - 2, -1, -1):
+        dp = correct[:, k].long() * (dp + 1)
+        dyn_lengths[:, k] = dp
+
+    # mask out positions that do not participate in loss
+    dyn_lengths = dyn_lengths * loss_mask.long()
+
+    # 简单 batch 统计（仅看第一个样本）
+    lens = dyn_lengths[0]
+    print(
+        f"Dynamic length stats (sample 0): "
+        f"len={len(lens)}, "
+        f"min={min(lens)}, "
+        f"max={max(lens)}, "
+        f"mean={sum(lens)/len(lens):.3f}"
+    )
+    # ============================================================
+    # 4. Generate Eagle3 data (unchanged)
+    # ============================================================
+    eagle3_data = target_model.generate_eagle3_data(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        loss_mask=loss_mask,
+    )
+
+    input_ids = get_dp_data_shard_from_tp(eagle3_data.input_ids)
+    attention_mask = get_dp_data_shard_from_tp(eagle3_data.attention_mask)
+    loss_mask = get_dp_data_shard_from_tp(eagle3_data.loss_mask)
+    target = get_dp_data_shard_from_tp(eagle3_data.target)
+    hidden_states = get_dp_data_shard_from_tp(eagle3_data.hidden_states)
+
+    # ============================================================
+    # 5. Eagle forward with dynamic_length
+    # ============================================================
+    plosses, _, acces = eagle3_model(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        loss_mask=loss_mask,
+        target=target,
+        hidden_states=hidden_states,
+        dynamic_length=dyn_lengths, 
+    )
+
+    return plosses, acces, dyn_lengths
 
 def run_forward(
     args: Namespace,
@@ -692,6 +865,59 @@ def get_dp_data_shard_from_tp(tensor: torch.Tensor, sp_dim: int = 1) -> torch.Te
     return local_tp_shard
 
 
+def setup_idk_token(args, draft_model):
+    """
+    Add an extra <IDK> output column to draft model lm_head.
+
+    After this:
+        lm_head.out_features = draft_vocab_size + 1
+        idk_index = last column
+    """
+
+    lm_head = draft_model.lm_head
+    assert isinstance(lm_head, nn.Linear)
+    assert lm_head.bias is None, "Expected bias=False lm_head"
+
+    old_out = lm_head.out_features
+    hidden_size = lm_head.in_features
+    device = lm_head.weight.device
+    dtype = lm_head.weight.dtype
+
+
+    new_lm_head = nn.Linear(
+        hidden_size,
+        old_out + 1,
+        bias=False,
+        device=device,
+        dtype=dtype,
+    )
+
+    with torch.no_grad():
+        new_lm_head.weight[:old_out].copy_(lm_head.weight)
+
+        # IDK init strategy:
+        # Option A (recommended): small negative bias → discouraged by default
+        new_lm_head.weight[old_out].zero_()
+
+    draft_model.lm_head = new_lm_head
+
+    idk_index = old_out
+    draft_model.register_buffer(
+        "idk_index",
+        torch.tensor(idk_index, dtype=torch.long),
+        persistent=True,
+    )
+
+    draft_model.has_idk_head = True
+
+    if hasattr(args, "verbose") and args.verbose:
+        print(
+            f"[IDK] Added <IDK> head: lm_head {old_out} → {old_out + 1}, "
+            f"idk_index={idk_index}"
+        )
+
+    return idk_index
+
 def main():
     # ================================================
     # 1. Initialize
@@ -844,9 +1070,14 @@ def main():
             # ================================================
             # 7.1 Training Step
             # ================================================
-            plosses, acces = run_forward(
-                args, eagle3_model, data, target_model, is_online
-            )
+            if args.use_dynamic_length_training:
+                plosses, acces, dynamic_length = run_forward_dynamic_length(
+                    args, eagle3_model, data, target_model, is_online
+                )
+            else:
+                plosses, acces = run_forward(
+                    args, eagle3_model, data, target_model, is_online
+                )
             run_backward_and_update(args, plosses, optimizer, global_step)
 
             # log training metrics
