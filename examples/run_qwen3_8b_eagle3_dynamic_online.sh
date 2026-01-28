@@ -38,7 +38,7 @@ torchrun \
     --draft-model-config $ROOT_DIR/configs/qwen3-8b-eagle3.json \
     --train-data-path $ROOT_DIR/cache/dataset/sharegpt_train.jsonl \
     --build-dataset-num-proc $BUILD_DATASET_NUM_PROC \
-    --output-dir $ROOT_DIR/outputs/qwen3-8b-eagle3-dynamic-sharegpt \
+    --output-dir $ROOT_DIR/outputs/qwen3-8b-eagle3-idk-soft-dynamic-sharegpt \
     --num-epochs 10 \
     --batch-size 1 \
     --learning-rate 1e-4 \

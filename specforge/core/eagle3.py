@@ -121,6 +121,91 @@ class OnlineEagle3Model(Eagle3Model):
 
         return target_p, dynamic_position_mask
 
+    def fix_target_p_soft(
+        self,
+        target_p: torch.Tensor,          # [B, S, V]
+        dynamic_lengths: torch.Tensor,   # [B, S]
+        idx: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Apply soft <IDK> training rule.
+
+        Rules:
+        - idx < dyn_len:
+            p_soft = top * target_p + (1 - top) * IDK_onehot
+        - idx == dyn_len:
+            p = IDK_onehot
+        - idx > dyn_len:
+            masked out
+
+        Returns:
+            fixed_target_p: [B, S, V']  (V' = V or V+1)
+            dynamic_position_mask: [B, S] (0/1)
+        """
+        B, S, V = target_p.shape
+        device = target_p.device
+        dtype = target_p.dtype
+        idk_index = self.draft_model.idk_index.item()
+
+        need_extra_idk = (idk_index >= V)
+
+        if need_extra_idk:
+            idk_col = torch.zeros((B, S, 1), device=device, dtype=dtype)
+            target_p = torch.cat([target_p, idk_col], dim=-1)
+            Vp = V + 1
+        else:
+            Vp = V
+
+        idx_tensor = torch.full_like(dynamic_lengths, idx)
+
+        lt_mask = idx_tensor < dynamic_lengths     # soft
+        eq_mask = idx_tensor == dynamic_lengths    # hard IDK
+        gt_mask = idx_tensor > dynamic_lengths     # drop
+
+        # ------------------------------------------------------------
+        # Step 3: soft mixing for lt_mask
+        # ------------------------------------------------------------
+        if lt_mask.any():
+            # top1 value and index
+            top_vals, top_idx = target_p.max(dim=-1, keepdim=True)
+            top_vals = top_vals.detach()
+
+            # amount of mass to move to IDK
+            idk_mass = 1.0 - top_vals  # [B, S, 1]
+
+            # clone to avoid in-place autograd issues
+            soft_p = target_p.clone()
+
+            # subtract from top1
+            soft_p.scatter_add_(
+                dim=-1,
+                index=top_idx,
+                src=-idk_mass
+            )
+
+            # add to IDK
+            soft_p[..., idk_index] += idk_mass.squeeze(-1)
+
+            target_p = torch.where(
+                lt_mask.unsqueeze(-1),
+                soft_p,
+                target_p,
+            )
+
+        # ------------------------------------------------------------
+        # Step 4: hard IDK for eq_mask
+        # ------------------------------------------------------------
+        if eq_mask.any():
+            target_p[eq_mask] = 0.0
+            target_p[eq_mask, idk_index] = 1.0
+
+        # ------------------------------------------------------------
+        # Step 5: dynamic position mask
+        # ------------------------------------------------------------
+        dynamic_position_mask = (~gt_mask).unsqueeze(-1).int()
+
+        return target_p, dynamic_position_mask
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -152,6 +237,7 @@ class OnlineEagle3Model(Eagle3Model):
         del target
         dynamic_lengths = kwargs.get("dynamic_lengths", None)
         use_idk = dynamic_lengths is not None
+        # print(self.draft_model.idk_index, dynamic_lengths, use_idk)
 
         # basic info
         batch_size, seq_length, _ = hidden_states.shape
@@ -215,24 +301,23 @@ class OnlineEagle3Model(Eagle3Model):
         for idx in range(self.length):
             target_p = target_p_padded[:, idx : idx + seq_length, :]
 
+            # KEY CHANGE: handle dynamic length training
             if use_idk:
                 # dynamic_lengths: [B, S]
-                target_p, dynamic_position_mask = fix_target_p(
+                # target_p, dynamic_position_mask = fix_target_p(
+                #     target_p=target_p,
+                #     dynamic_lengths=dynamic_lengths,
+                #     idx=idx,
+                # )
+                target_p, dynamic_position_mask = self.fix_target_p_soft(
                     target_p=target_p,
                     dynamic_lengths=dynamic_lengths,
                     idx=idx,
                 )
-
+                # print(target_p.shape, position_mask.shape, loss_mask.shape, dynamic_position_mask.shape)
+                
                 # combine with original position_mask
                 position_mask = position_mask * dynamic_position_mask
-            else:
-                # no IDK → still need to pad IDK column for lm_head
-                idk_col = torch.zeros(
-                    (*target_p.shape[:2], 1),
-                    device=target_p.device,
-                    dtype=target_p.dtype,
-                )
-                target_p = torch.cat([target_p, idk_col], dim=-1)
 
             if self.attention_backend == "usp":
                 input_ids = self.prepare_usp_input(global_input_ids)

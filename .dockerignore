@@ -1,0 +1,58 @@
+# =========================
+# Git / 编辑器
+# =========================
+.git
+.gitignore
+.vscode
+.idea
+.github
+
+# =========================
+# Python
+# =========================
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# =========================
+# Conda / pip cache
+# =========================
+.cache/
+pip-cache/
+conda-bld/
+
+# =========================
+# 训练产物 / 日志
+# =========================
+outputs/
+output/
+logs/
+checkpoints/
+ckpt/
+wandb/
+runs/
+tb/
+tensorboard/
+cache/
+
+# =========================
+# 数据（不要打进镜像）
+# =========================
+data/
+datasets/
+
+# =========================
+# HuggingFace / Torch cache
+# =========================
+.cache/huggingface/
+.cache/torch/
+
+# =========================
+# 系统杂项
+# =========================
+.DS_Store

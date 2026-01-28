@@ -404,9 +404,6 @@ def build_draft_model(args: Namespace) -> Tuple[AutoDraftModelConfig, nn.Module]
     draft_model.load_embedding(args.target_model_path, embedding_key=args.embedding_key)
     draft_model.freeze_embedding()
 
-    if args.use_dynamic_length_training:
-        setup_idk_token(args, draft_model)
-
     return draft_model_config, draft_model
 
 
@@ -708,7 +705,7 @@ def run_forward_dynamic_length(
         loss_mask=loss_mask,
         target=target,
         hidden_states=hidden_states,
-        dynamic_length=dyn_lengths, 
+        dynamic_lengths=dyn_lengths, 
     )
 
     return plosses, acces, dyn_lengths
@@ -865,7 +862,7 @@ def get_dp_data_shard_from_tp(tensor: torch.Tensor, sp_dim: int = 1) -> torch.Te
     return local_tp_shard
 
 
-def setup_idk_token(args, draft_model):
+def setup_idk_token(args, draft_model, draft_model_config):
     """
     Add an extra <IDK> output column to draft model lm_head.
 
@@ -883,25 +880,59 @@ def setup_idk_token(args, draft_model):
     device = lm_head.weight.device
     dtype = lm_head.weight.dtype
 
+    # Only <IDK> token need to add a new output column
+    # For other existing tokens, no change, just record the idk_index
+    # print(args.idk_token)
+    if args.idk_token == "<IDK>":
+        new_lm_head = nn.Linear(
+            hidden_size,
+            old_out + 1,
+            bias=False,
+            device=device,
+            dtype=dtype,
+        )
 
-    new_lm_head = nn.Linear(
-        hidden_size,
-        old_out + 1,
-        bias=False,
-        device=device,
-        dtype=dtype,
-    )
+        with torch.no_grad():
+            new_lm_head.weight[:old_out].copy_(lm_head.weight)
 
-    with torch.no_grad():
-        new_lm_head.weight[:old_out].copy_(lm_head.weight)
+            # IDK init strategy:
+            # Option A (recommended): small negative bias → discouraged by default
+            new_lm_head.weight[old_out].zero_()
 
-        # IDK init strategy:
-        # Option A (recommended): small negative bias → discouraged by default
-        new_lm_head.weight[old_out].zero_()
+        draft_model.lm_head = new_lm_head
 
-    draft_model.lm_head = new_lm_head
-
-    idk_index = old_out
+        idk_index = old_out
+    else:
+        try:
+            idk_index = int(args.idk_token)
+        except ValueError:
+            tokenizer = AutoTokenizer.from_pretrained(
+                args.target_model_path, trust_remote_code=args.trust_remote_code
+            )
+            idk_index = tokenizer.convert_tokens_to_ids(args.idk_token)
+            if idk_index is None:
+                raise ValueError(
+                    f"Cannot find token id for idk_token: {args.idk_token}"
+                )
+        # Find the corresponding index for draft_model
+        if draft_model_config.draft_vocab_size != draft_model_config.vocab_size:
+            # draft_model.d2t is a tensor, which define as 
+            # d2t = [used_tokens[i] - i for i in range(len(used_tokens))]
+            # according to the idk_index, find the correct id in draft vocab
+            used_tokens = draft_model.d2t + torch.arange(
+                draft_model.d2t.numel(), device=draft_model.d2t.device
+            )
+            mapping_t2d = {
+                int(t.item()): i
+                for i, t in enumerate(used_tokens)
+            }
+            try:
+                draft_idk_index = mapping_t2d[idk_index]
+            except KeyError:
+                raise ValueError(
+                    f"idk_index {idk_index} not found in draft vocab"
+                )
+    
     draft_model.register_buffer(
         "idk_index",
         torch.tensor(idk_index, dtype=torch.long),
@@ -910,11 +941,10 @@ def setup_idk_token(args, draft_model):
 
     draft_model.has_idk_head = True
 
-    if hasattr(args, "verbose") and args.verbose:
-        print(
-            f"[IDK] Added <IDK> head: lm_head {old_out} → {old_out + 1}, "
-            f"idk_index={idk_index}"
-        )
+    print(
+        f"[IDK] Added <IDK> head: lm_head {old_out} → {old_out + 1}, "
+        f"idk_index={idk_index}"
+    )
 
     return idk_index
 
@@ -952,8 +982,17 @@ def main():
     )
 
     # we load the vocab mapping then
-    draft_model.load_vocab_mapping(vocab_mapping_path)
-    print_with_rank("Loaded vocab mapping")
+    # if draft model vocab size == target model vocab size, we maintain a simple 1-1 mapping
+    # print(draft_model_config)
+    if draft_model_config.draft_vocab_size != draft_model_config.vocab_size:
+        draft_model.load_vocab_mapping(vocab_mapping_path)
+        print_with_rank("Loaded vocab mapping")
+    else:
+        draft_model.load_vocab_mapping(None)
+        print_with_rank("Draft vocab size matches target vocab size, loaded identity mapping")
+    
+    if args.use_dynamic_length_training:
+        setup_idk_token(args, draft_model, draft_model_config)
 
     # Calculate total steps if not provided
     if args.total_steps is None:

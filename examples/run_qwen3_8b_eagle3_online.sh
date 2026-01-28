@@ -26,4 +26,6 @@ torchrun \
     --cache-dir $ROOT_DIR/cache \
     --embedding-key model.embed_tokens.weight \
     --tp-size $TP_SIZE \
-    --target-model-backend sglang
+    --target-model-backend sglang \
+    --report-to wandb \
+    --wandb-project dynamic_length_train

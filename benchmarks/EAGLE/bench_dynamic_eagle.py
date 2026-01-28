@@ -226,7 +226,7 @@ def main():
 
     base_model_path = "/mtc/models/qwen3-8b"
     baseline_eagle_path = "/mtc/models/qwen3-8b-eagle3"
-    dynamic_eagle_path = "/mtc/chenjunyi1/project/SpecForge/outputs/qwen3-8b-eagle3-dynamic-sharegpt/epoch_9_step_603370"
+    dynamic_eagle_path = "/mtc/chenjunyi1/project/SpecForge/outputs/qwen3-8b-eagle3-idk-dynamic-sharegpt/epoch_9_step_603370"
 
     tokenizer = AutoTokenizer.from_pretrained(base_model_path, use_fast=False)
     depth = 7
