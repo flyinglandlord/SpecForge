@@ -155,7 +155,6 @@ class OnlineEagle3Model(Eagle3Model):
             Vp = V + 1
         else:
             Vp = V
-
         idx_tensor = torch.full_like(dynamic_lengths, idx)
 
         lt_mask = idx_tensor < dynamic_lengths     # soft
@@ -227,6 +226,7 @@ class OnlineEagle3Model(Eagle3Model):
             past_key_values: We dont use this past_key_values in eagle3, but keep it for compatibility. We control kvcache by cache_hidden.
             position_ids: (batch, seq_len)
         """
+        # print("forward dynamic length:", input_ids.shape, attention_mask.shape, loss_mask.shape)
         # Step 1: handle vocab size
         target_p_padded, position_mask = _compute_target_p_padded(
             target=target,
@@ -315,7 +315,8 @@ class OnlineEagle3Model(Eagle3Model):
                     idx=idx,
                 )
                 # print(target_p.shape, position_mask.shape, loss_mask.shape, dynamic_position_mask.shape)
-                
+                # print("shapes:", dynamic_position_mask.shape, position_mask.shape)
+
                 # combine with original position_mask
                 position_mask = position_mask * dynamic_position_mask
 
@@ -357,6 +358,7 @@ class OnlineEagle3Model(Eagle3Model):
                         loss_mask=loss_mask,
                     )
                 )
+            # print("shapes:", target_p.shape, position_mask.shape, logits.shape)
 
             # Step 5.6: calculate loss, in-place modifies logits!
             loss = LogSoftmaxLoss.apply(logits, target_p, position_mask)

@@ -573,45 +573,32 @@ def run_forward_dynamic_length(
     attention_mask = data["attention_mask"].cuda()
     loss_mask = data["loss_mask"].cuda()
 
+    # print('run forward dynamic length:', input_ids.shape, attention_mask.shape, loss_mask.shape)
+
+    # 1. Generate Eagle3 data (unchanged) with logits
+    eagle3_data = target_model.generate_eagle3_data(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        loss_mask=loss_mask,
+    )
+
+    input_ids = get_dp_data_shard_from_tp(eagle3_data.input_ids)
+    attention_mask = get_dp_data_shard_from_tp(eagle3_data.attention_mask)
+    loss_mask = get_dp_data_shard_from_tp(eagle3_data.loss_mask)
+    target = get_dp_data_shard_from_tp(eagle3_data.target)
+    hidden_states = get_dp_data_shard_from_tp(eagle3_data.hidden_states)
+
     B, T = input_ids.shape
+    device = input_ids.device
 
-    # ============================================================
-    # 1. Target model forward to get logits
-    # ============================================================
-    with torch.no_grad():
-        if isinstance(target_model, SGLangEagle3TargetModel):
-            _, logits_list, _, _ = (
-                target_model.extend(
-                    input_ids,
-                    attention_mask,
-                    loss_mask,
-                    return_last_hidden_states=False,
-                    return_logits=True,
-                )
-            )
-            logits = torch.stack(
-                [logit for logit in logits_list], dim=0) # [B, T, V]
-        else:
-            outputs = target_model(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                return_dict=True,
-            )
-            logits = outputs.logits  # [B, T, V]
-    # print(f"{type(logits)} Logits: {logits.shape}")
-
-    # ============================================================
     # 2. Compute top-1 predictions
-    # ============================================================
-    top1_ids = logits.argmax(dim=-1)  # [B, T]
+    top1_ids = target.argmax(dim=-1)  # [B, T]
     # print(f"top1_ids: {top1_ids.shape}")
 
-    # ============================================================
     # 3. Compute dynamic length per sample
-    #    连续 top1 == GT 的 token 个数
-    # ============================================================
-
+    # 连续 top1 == GT 的 token 个数
     # Decode一下每一次的top1预测，同时也decode一下数据集的input_id，比较一下
+
     # tokenizer = AutoTokenizer.from_pretrained(args.target_model_path)
     # print("Sample top1 vs GT comparison:")
     # for i in range(min(2, B)):
@@ -650,27 +637,24 @@ def run_forward_dynamic_length(
     #     dyn_lengths.append(per_pos_lengths)
 
     # Vectorized implementation
-    B, T = input_ids.shape
-    device = input_ids.device
-    top1_ids = top1_ids.to(device)
+    top1_ids = top1_ids.view(B, T).to(device)       # 确保形状是 [B, T]
 
     # correctness mask: [B, T-1]
     correct = (
         (top1_ids[:, :-1] == input_ids[:, 1:]) &
-        (loss_mask[:, :-1].bool()) &
-        (loss_mask[:, 1:].bool())
+        (loss_mask[:, :-1].view(B, T - 1).bool()) &
+        (loss_mask[:, 1:].view(B, T - 1).bool())
     )
 
     dyn_lengths = torch.zeros((B, T), device=device, dtype=torch.long)
-
     dp = torch.zeros((B,), device=device, dtype=torch.long)
-
     for k in range(T - 2, -1, -1):
         dp = correct[:, k].long() * (dp + 1)
         dyn_lengths[:, k] = dp
+        
 
     # mask out positions that do not participate in loss
-    dyn_lengths = dyn_lengths * loss_mask.long()
+    dyn_lengths = dyn_lengths * loss_mask.view(B, T).long()
 
     # 简单 batch 统计（仅看第一个样本）
     lens = dyn_lengths[0]
@@ -681,24 +665,8 @@ def run_forward_dynamic_length(
         f"max={max(lens)}, "
         f"mean={sum(lens)/len(lens):.3f}"
     )
-    # ============================================================
-    # 4. Generate Eagle3 data (unchanged)
-    # ============================================================
-    eagle3_data = target_model.generate_eagle3_data(
-        input_ids=input_ids,
-        attention_mask=attention_mask,
-        loss_mask=loss_mask,
-    )
 
-    input_ids = get_dp_data_shard_from_tp(eagle3_data.input_ids)
-    attention_mask = get_dp_data_shard_from_tp(eagle3_data.attention_mask)
-    loss_mask = get_dp_data_shard_from_tp(eagle3_data.loss_mask)
-    target = get_dp_data_shard_from_tp(eagle3_data.target)
-    hidden_states = get_dp_data_shard_from_tp(eagle3_data.hidden_states)
-
-    # ============================================================
-    # 5. Eagle forward with dynamic_length
-    # ============================================================
+    # 4. Eagle forward with dynamic_length
     plosses, _, acces = eagle3_model(
         input_ids=input_ids,
         attention_mask=attention_mask,
