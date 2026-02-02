@@ -9,6 +9,62 @@ from transformers import AutoTokenizer, AutoModelForCausalLM
 import torch.nn.functional as F
 import numpy as np
 
+def mtp_sampling_early_exit_hook(hook_state):
+    """
+    Stochastic early exit based on MTP UNK-head logits.
+
+    mtp_logits shape: [K, vocab_size + 1]
+    The last column (-1) corresponds to exit / UNK probability.
+    """
+    mtp_logits = hook_state['mtp_module_logits']
+    candidates = hook_state['draft_candidates']
+
+    K = mtp_logits.shape[0]
+
+    # take UNK / exit logits: [K]
+    p_exit = torch.sigmoid(mtp_logits[:, -1])
+
+    # sequential Bernoulli stopping
+    for i in range(K):
+        r = torch.rand((), device=p_exit.device)
+        if r < p_exit[i]:
+            return i  # accept i tokens, exit here
+
+    # no exit happened
+    return K
+
+
+def baseline_sampling_early_exit_hook(hook_state):
+    """
+    Baseline stochastic early exit based on max softmax probability.
+
+    mtp_logits shape: [K, vocab_size]
+    At each position i:
+        p_continue = max softmax prob
+        p_exit = 1 - p_continue
+    """
+    mtp_logits = hook_state['mtp_module_logits']
+    candidates = hook_state['draft_candidates']
+
+    # number of draft tokens
+    K = candidates.shape[1] - 1
+
+    # mtp_logits: [K, V]
+    # compute p_continue = max softmax prob
+    probs = torch.softmax(mtp_logits, dim=-1)      # [K, V]
+    p_continue = probs.max(dim=-1).values               # [K]
+    # print(p_continue)
+
+    # sequential sampling
+    for i in range(K):
+        r = torch.rand((), device=p_continue.device)
+        if r > p_continue[i]:
+            return i  # exit here, accept i tokens
+
+    # no exit happened
+    return K
+
+
 def early_exit_until_zero(hook_state):
     """
     Sequential early-exit rule:
@@ -41,13 +97,13 @@ def fully_exit_hook(hook_state):
     return len(candidates[0]) - 1
 
 # Load your model
-model_device = "cuda:1"
-baseline_model_device = "cuda:2"
+model_device = "cuda:4"
+baseline_model_device = "cuda:5"
 
 depth = 7
-base_model_path = "/mtc/models/qwen3-8b"
-baseline_EAGLE_model_path = "/mtc/models/qwen3-8b-eagle3"
-EAGLE_model_path = "/mtc/chenjunyi1/project/SpecForge/outputs/qwen3-8b-eagle3-dynamic-sharegpt/epoch_9_step_603370"
+base_model_path = "/data/chenjunyi/models/qwen3-8b"
+baseline_EAGLE_model_path = "/data/chenjunyi/models/qwen3-8b-eagle3"
+EAGLE_model_path = "/data/chenjunyi/project/SpecForge/outputs/qwen3-8b-eagle3-unkhead_only-dynamic-sharegpt/epoch_9_step_145000"
 model = EaModel.from_pretrained(
     base_model_path=base_model_path,
     ea_model_path=EAGLE_model_path,
@@ -91,12 +147,12 @@ prompt_len = input_ids.shape[1]
 max_new_tokens = 2048
 
 # Generate with early exit hook and collect statistics
-output_ids, stats = model.eagenerate_with_early_exit_hook(
+output_ids, stats = model.eagenerate_with_unk_head(
     input_ids=input_ids.to(model_device),
     log=True,  # Important: set log=True to get statistics
     max_new_tokens=max_new_tokens,
     top_k=1,
-    early_exit_hook=early_exit_until_zero,
+    early_exit_hook=mtp_sampling_early_exit_hook,
 )
 
 print(tokenizer.decode(output_ids[0], skip_special_tokens=True))
@@ -106,7 +162,7 @@ baseline_output_ids, stats_baseline = baseline_model.eagenerate_with_early_exit_
     log=True,
     max_new_tokens=max_new_tokens,
     top_k=1,
-    early_exit_hook=fully_exit_hook,  # No early exit
+    early_exit_hook=baseline_sampling_early_exit_hook,  # No early exit
 )
 
 print(tokenizer.decode(baseline_output_ids[0], skip_special_tokens=True))

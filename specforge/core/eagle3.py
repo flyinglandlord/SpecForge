@@ -123,84 +123,64 @@ class OnlineEagle3Model(Eagle3Model):
 
     def fix_target_p_soft(
         self,
-        target_p: torch.Tensor,          # [B, S, V]
-        dynamic_lengths: torch.Tensor,   # [B, S]
+        target_p: torch.Tensor,          # [B, S, V] 原始主模型输出
+        dynamic_lengths: torch.Tensor,   # [B, S] 截断位置
         idx: int,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Apply soft <IDK> training rule.
-
-        Rules:
-        - idx < dyn_len:
-            p_soft = top * target_p + (1 - top) * IDK_onehot
-        - idx == dyn_len:
-            p = IDK_onehot
-        - idx > dyn_len:
-            masked out
-
-        Returns:
-            fixed_target_p: [B, S, V']  (V' = V or V+1)
-            dynamic_position_mask: [B, S] (0/1)
+        修改目标概率分布以训练 <IDK>。
+        Logic:
+        1. Match (idx < len): Target_IDK = 1.0 - P_Main(Top1). 
+           含义: 即使正确，如果不自信，也要提高 IDK 概率。
+        2. Mismatch (idx == len): Target_IDK = 1.0. 
+           含义: 此处必须截断。
+        3. Ignore (idx > len): Mask out.
         """
         B, S, V = target_p.shape
         device = target_p.device
         dtype = target_p.dtype
         idk_index = self.draft_model.idk_index.item()
 
+        # 如果 IDK token 是词表外的新 token，拼接一列
         need_extra_idk = (idk_index >= V)
-
         if need_extra_idk:
             idk_col = torch.zeros((B, S, 1), device=device, dtype=dtype)
+            # clone 确保不修改原始引用 (虽然下面还是会修改)
             target_p = torch.cat([target_p, idk_col], dim=-1)
-            Vp = V + 1
         else:
-            Vp = V
+            target_p = target_p.clone()
+
         idx_tensor = torch.full_like(dynamic_lengths, idx)
 
-        lt_mask = idx_tensor < dynamic_lengths     # soft
-        eq_mask = idx_tensor == dynamic_lengths    # hard IDK
-        gt_mask = idx_tensor > dynamic_lengths     # drop
+        # Masks
+        lt_mask = idx_tensor < dynamic_lengths     # Match: Soft IDK
+        eq_mask = idx_tensor == dynamic_lengths    # Mismatch: Hard IDK
+        gt_mask = idx_tensor > dynamic_lengths     # Ignore
 
-        # ------------------------------------------------------------
-        # Step 3: soft mixing for lt_mask
-        # ------------------------------------------------------------
+        # --- Step 1: 处理 Match (Soft Label) ---
         if lt_mask.any():
-            # top1 value and index
-            top_vals, top_idx = target_p.max(dim=-1, keepdim=True)
-            top_vals = top_vals.detach()
+            # 获取主模型当前的 Top-1 置信度
+            # 注意：取 max 时要避开 IDK 列 (如果 IDK 在最后)
+            vocab_probs = target_p[..., :idk_index] if need_extra_idk else target_p
+            top_vals, _ = vocab_probs.max(dim=-1)   # [B, S]
+            top_vals = top_vals.detach() # 梯度截断，Target 是常数
 
-            # amount of mass to move to IDK
-            idk_mass = 1.0 - top_vals  # [B, S, 1]
-
-            # clone to avoid in-place autograd issues
-            soft_p = target_p.clone()
-
-            # subtract from top1
-            soft_p.scatter_add_(
-                dim=-1,
-                index=top_idx,
-                src=-idk_mass
-            )
-
-            # add to IDK
-            soft_p[..., idk_index] += idk_mass.squeeze(-1)
-
-            target_p = torch.where(
-                lt_mask.unsqueeze(-1),
-                soft_p,
-                target_p,
-            )
-
-        # ------------------------------------------------------------
-        # Step 4: hard IDK for eq_mask
-        # ------------------------------------------------------------
+            # 代理目标: IDK = 1 - Confidence
+            soft_idk_target = 1.0 - top_vals 
+            
+            # 填入 IDK 位置
+            target_p[lt_mask, idk_index] = soft_idk_target[lt_mask]
+        
+        # --- Step 2: 处理 Mismatch (Hard Label) ---
         if eq_mask.any():
-            target_p[eq_mask] = 0.0
+            # 在截断点，强制 IDK 为 1.0
             target_p[eq_mask, idk_index] = 1.0
+            # 如果希望此时 CE Loss 不受干扰，target_non_idk 不变即可
+            # BCE Loss 负责拉高 IDK logit，CE Loss 负责让它即便在截断处也预测正确的 token
+            # 这样有利于 tree structure 的完整性
 
-        # ------------------------------------------------------------
-        # Step 5: dynamic position mask
-        # ------------------------------------------------------------
+        # --- Step 3: 生成参与 Loss 计算的 Mask ---
+        # 只有 <= dynamic_lengths 的位置参与训练
         dynamic_position_mask = (~gt_mask).unsqueeze(-1).int()
 
         return target_p, dynamic_position_mask
@@ -283,6 +263,10 @@ class OnlineEagle3Model(Eagle3Model):
         plosses = []
         vlosses = []
         acces = []
+        # 用于累积 IDK 的监控指标 (总误差 / 总有效数)
+        total_idk_diff = 0.0
+        total_valid_idk_tokens = 0.0
+
         # for sequence paralle, position mask and input ids will split by sequence dim, need to keep origin for ttt shift
         global_input_ids = input_ids
         if self.attention_backend in ["sdpa", "fa"]:
@@ -301,24 +285,21 @@ class OnlineEagle3Model(Eagle3Model):
         for idx in range(self.length):
             target_p = target_p_padded[:, idx : idx + seq_length, :]
 
-            # KEY CHANGE: handle dynamic length training
+            # <<<<<<<<<<<<<< KEY CHANGE 1: Dynamic Length & Target Fix >>>>
             if use_idk:
-                # dynamic_lengths: [B, S]
-                # target_p, dynamic_position_mask = fix_target_p(
-                #     target_p=target_p,
-                #     dynamic_lengths=dynamic_lengths,
-                #     idx=idx,
-                # )
-                target_p, dynamic_position_mask = self.fix_target_p_soft(
+                # 使用修改后的 fix_target_p_soft
+                # 注意：target_p 在这里被 clone 修改，包含 IDK 目标值
+                target_p_with_idk, dynamic_position_mask = self.fix_target_p_soft(
                     target_p=target_p,
                     dynamic_lengths=dynamic_lengths,
                     idx=idx,
                 )
-                # print(target_p.shape, position_mask.shape, loss_mask.shape, dynamic_position_mask.shape)
-                # print("shapes:", dynamic_position_mask.shape, position_mask.shape)
-
-                # combine with original position_mask
-                position_mask = position_mask * dynamic_position_mask
+                # 更新 mask：原始 mask AND 动态长度 mask
+                # 只有还没遇到 mismatch (lt) 或者刚好遇到 mismatch (eq) 的位置才计算 Loss
+                current_position_mask = position_mask * dynamic_position_mask
+            else:
+                current_position_mask = position_mask
+            # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
 
             if self.attention_backend == "usp":
                 input_ids = self.prepare_usp_input(global_input_ids)
@@ -348,21 +329,95 @@ class OnlineEagle3Model(Eagle3Model):
             # Step 5.4: get logits
             logits = self.draft_model.compute_logits(hidden_states)
             logits = gather_outputs_and_unpad(logits, gather_dim=1)
+
+            # print("shapes:", target_p.shape, position_mask.shape, logits.shape)
+            # Step 5.6: calculate loss, in-place modifies logits!
+            if use_idk:
+                # <<<<<<<<<<<<<< KEY CHANGE 2: Loss Calculation >>>>>>>>>>>>>>
+                idk_index = self.draft_model.idk_index
+                eps = 1e-8
+                
+                # 1. 拆分 Logits
+                # [B, S, 1]
+                logits_idk = logits[..., idk_index].unsqueeze(-1)
+                # [B, S, V] (移除了 IDK 列)
+                logits_non_idk = torch.cat(
+                    [logits[..., :idk_index], logits[..., idk_index + 1 :]], dim=-1
+                ) 
+
+                # 2. 拆分 Targets
+                # target_p_with_idk 来自 fix_target_p_soft
+                target_idk_val = target_p_with_idk[..., idk_index].unsqueeze(-1) # [B, S, 1]
+                
+                # 构造用于 CE 的 target (归一化的 main model probs)
+                # 注意：fix_target_p_soft 修改了 target_p 的 idk 列，
+                # 但 target_non_idk 应该是原始的主模型分布 (除去 idk 位)
+                # 这样 loss_ce 专注于拟合 Top-1 Token，loss_idk 专注于拟合 Risk
+                target_non_idk = torch.cat(
+                    [target_p[..., :idk_index], target_p[..., idk_index + 1 :]], dim=-1
+                ) # [B, S, V]
+
+                # 3. 计算有效 Token 数量
+                # current_position_mask: [B, S, 1]
+                # loss_mask: [B, S] (padding mask)
+                # 真正的有效 mask = padding mask & dynamic cutoff mask
+                valid_mask = current_position_mask * loss_mask
+                num_valid = valid_mask.sum() + eps
+
+                # 4. CE Loss (Next Token Prediction)
+                # loss_ce_raw = LogSoftmaxLoss.apply(logits_non_idk, target_non_idk)
+                # loss_ce = (loss_ce_raw * valid_mask.squeeze(-1)).sum() / num_valid
+                loss_ce = LogSoftmaxLoss.apply(logits_non_idk, target_non_idk, valid_mask)
+
+                # 5. IDK Loss (Risk Prediction - Relative Logic)
+                # (A) 找到最好的那个词的 Logit
+                # 使用 detach() 停止梯度，避免 IDK Loss 压低正常词汇的 Logit 来作弊
+                vocab_max_logit = logits_non_idk.max(dim=-1, keepdim=True).values.detach()
+                
+                # (B) 计算相对 Logit
+                # 如果这个差值 > 0, 说明 IDK 胜出；< 0 说明 Token 胜出
+                relative_idk_logit = logits_idk - vocab_max_logit
+                
+                # (C) 使用 BCEWithLogitsLoss 计算二分类损失
+                # 能够提高数值稳定性，等价于 BCELoss(sigmoid(relative_logit), target)
+                loss_idk_raw = F.binary_cross_entropy_with_logits(
+                    relative_idk_logit, 
+                    target_idk_val, 
+                    reduction='none'
+                )
+                
+                loss_idk = (loss_idk_raw * valid_mask).sum() / num_valid
+
+                loss = loss_ce + 2.0 * loss_idk  # 建议稍微加权 IDK Loss
+                
+                # 6. 记录指标 (MAE - 基于相对概率)
+                with torch.no_grad():
+                    # 这里也要用同样的逻辑计算概率，以便指标有物理意义
+                    probs_risk = torch.sigmoid(relative_idk_logit)
+                    
+                    abs_diff = torch.abs(probs_risk - target_idk_val)
+                    masked_diff = abs_diff * valid_mask
+                    
+                    total_idk_diff += masked_diff.sum().item()
+                    total_valid_idk_tokens += num_valid.item()
+                # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+            else:
+                logits_non_idk = logits
+                target_non_idk = target_p
+                loss = LogSoftmaxLoss.apply(logits, target_p, position_mask)
+
+            plosses.append(loss)
+
             # Step 5.5: record metrics first as we in-place modify logits
             with torch.no_grad():
                 acces.append(
                     _compute_metric_acc(
-                        logits=logits,
-                        target_p=target_p,
+                        logits=logits_non_idk,
+                        target_p=target_non_idk,
                         position_mask=position_mask,
                         loss_mask=loss_mask,
                     )
                 )
-            # print("shapes:", target_p.shape, position_mask.shape, logits.shape)
-
-            # Step 5.6: calculate loss, in-place modifies logits!
-            loss = LogSoftmaxLoss.apply(logits, target_p, position_mask)
-            plosses.append(loss)
 
             if not is_last:
                 # Step 5.7: we need to update the loss mask
@@ -370,6 +425,18 @@ class OnlineEagle3Model(Eagle3Model):
                 position_mask = padding(position_mask, left=False)
                 loss_mask = padding(loss_mask, left=False)
                 # Flex attention mask shirnking is handled inside attention module
+        
+        # <<<<<<<<<< Metric Return >>>>>>>>>>
+        if use_idk:
+            # 计算整个 batch + 整个 sequence (所有 layers) 的平均 IDK MAE
+            if total_valid_idk_tokens > 0:
+                avg_idk_mae = total_idk_diff / total_valid_idk_tokens
+            else:
+                avg_idk_mae = 0.0
+            # 将 IDK 指标放在 acces 的最后
+            acces.append(torch.tensor(avg_idk_mae))
+        # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+        print(acces)
         return plosses, vlosses, acces
 
 

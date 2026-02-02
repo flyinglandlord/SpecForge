@@ -667,7 +667,7 @@ class Model(nn.Module):
         self.stable_kv = None
 
     @torch.no_grad()
-    def topK_genrate(self, hidden_states, input_ids, head, logits_processor):
+    def topK_genrate(self, hidden_states, input_ids, head, logits_processor, unk_head_softmax=False):
 
         input_ids = input_ids.to(hidden_states.device)
         total_tokens = self.total_tokens
@@ -699,7 +699,10 @@ class Model(nn.Module):
 
         # last_headout = head(last_hidden)
         last_headout = self.lm_head(self.norm(last_hidden))
-        last_p = self.logsoftmax(last_headout)
+        if unk_head_softmax:
+            last_p = self.logsoftmax(last_headout)
+        else:
+            last_p = self.logsoftmax(last_headout[:, :-1])
         ss_logits_list.append(last_headout)
         top = torch.topk(last_p, top_k, dim=-1)
         topk_index, topk_p = top.indices, top.values
@@ -733,7 +736,10 @@ class Model(nn.Module):
             parents_list.append(parents)
 
             last_headout = self.lm_head(self.norm(out_hidden[0]))
-            last_p = self.logsoftmax(last_headout)
+            if unk_head_softmax:
+                last_p = self.logsoftmax(last_headout)
+            else:
+                last_p = self.logsoftmax(last_headout[:, :-1])
             ss_logits_list.append(last_headout)
 
             top = torch.topk(last_p, top_k, dim=-1)

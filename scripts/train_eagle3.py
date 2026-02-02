@@ -695,11 +695,15 @@ def run_forward(
         )
     else:
         if is_online:
+            input_ids = data["input_ids"].cuda()
+            attention_mask = data["attention_mask"].cuda()
+            loss_mask = data["loss_mask"].cuda()
+            
             # we generate the eagle3 using the target model in an online fashion
             eagle3_data = target_model.generate_eagle3_data(
-                input_ids=data["input_ids"].cuda(),
-                attention_mask=data["attention_mask"].cuda(),
-                loss_mask=data["loss_mask"].cuda(),
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                loss_mask=loss_mask,
             )
 
             input_ids = get_dp_data_shard_from_tp(eagle3_data.input_ids)
@@ -759,14 +763,19 @@ def record_metrcs(
     accuracies = torch.stack(accuracies)
     plosses = torch.stack(plosses)
 
-    assert accuracies.shape[0] == args.ttt_length
+    # In case of we need to record the MSE of <IDK> in accuracies[-1]
+    # print(accuracies.shape)
+    assert accuracies.shape[0] == args.ttt_length or accuracies.shape[0] == args.ttt_length + 1
+
     dist.all_reduce(accuracies, op=dist.ReduceOp.AVG)
     accuracies = accuracies.cpu().tolist()
-    for i in range(len(accuracies)):
+    for i in range(len(accuracies[:-1])):
         logdict[f"{mode}/acc_{i}"] = accuracies[i]
         print_on_rank0(
             f"Eval - Step {global_step} [{global_step + 1}/{args.num_epochs}], position {i},  Acc: {accuracies[i]:.2f}"
         )
+    if len(accuracies) == args.ttt_length + 1:
+        logdict[f"{mode}/mse_<IDK>"] = accuracies[-1]
 
     dist.all_reduce(plosses, op=dist.ReduceOp.AVG)
     plosses = plosses.cpu().tolist()

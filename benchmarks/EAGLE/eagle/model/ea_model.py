@@ -208,6 +208,197 @@ class EaModel(nn.Module):
             return outputs, hidden_states
     
     @torch.no_grad()
+    def eagenerate_with_unk_head(
+        self,
+        input_ids,
+        temperature=0.0,
+        top_p=0.0,
+        top_k=1,            # by default, use greedy sampling for draft model, and only verify draft token chain
+        max_new_tokens=512,
+        max_length=2048,
+        log=False,
+        is_llama3=False,
+        early_exit_hook=None,  # Hook function to predict accept length for early exit
+    ):
+        """
+        Generate tokens with early exit hook for MTP module evaluation.
+        
+        Args:
+            early_exit_hook: A callable that takes (logits, candidates, hidden_state_new, outputs, step) 
+                           and returns predicted accept length for early exit simulation.
+        
+        Returns:
+            If log=False: input_ids
+            If log=True: (input_ids, stats_dict) where stats_dict contains:
+                - total_steps: total number of decoding steps
+                - total_tokens: total number of generated tokens
+                - true_accept_lengths: list of true accept lengths at each step
+                - predicted_accept_lengths: list of predicted accept lengths at each step
+                - early_exit_triggered: list of bools indicating if early exit was triggered
+                - true_acceptance_rate: average true acceptance rate
+                - predicted_acceptance_rate: average predicted acceptance rate
+                - acceptance_rate_gap: difference between predicted and true rates
+                - avg_true_accept_length: average true accept length
+                - avg_predicted_accept_length: average predicted accept length
+        """
+        if is_llama3:
+            stop_token_id = self.tokenizer.convert_tokens_to_ids("<|eot_id|>")
+
+        if temperature > 1e-5:
+            logits_processor = prepare_logits_processor(temperature=temperature, top_p=top_p, top_k=top_k)
+        else:
+            logits_processor = None
+        
+        # Statistics tracking
+        stats = {
+            'true_accept_lengths': [],
+            'predicted_accept_lengths': [],
+            'candidates': [],
+            'total_steps': 0,
+            'total_tokens': 0,
+        }
+
+        padding = (torch.zeros(1, 1, dtype=torch.long) - 1).to(input_ids.device)
+        input_ids = input_ids.clone()
+        self.ea_layer.reset_kv()
+
+        # Initialize the past key and value states
+        if hasattr(self, "past_key_values"):
+            past_key_values = self.past_key_values
+            past_key_values_data = self.past_key_values_data
+            current_length_data = self.current_length_data
+            # Reset the past key and value states
+            current_length_data.zero_()
+        else:
+            (
+                past_key_values,
+                past_key_values_data,
+                current_length_data,
+            ) = initialize_past_key_values(self.base_model, max_length=max_length)
+            self.past_key_values = past_key_values
+            self.past_key_values_data = past_key_values_data
+            self.current_length_data = current_length_data
+
+        input_len = input_ids.shape[1]
+        reset_tree_mode(self)
+        # prefill
+        draft_tokens, retrieve_indices, tree_mask, tree_position_ids, logits, hidden_state, sample_token, mtp_logits = initialize_tree(
+            input_ids, self, past_key_values, logits_processor, unk_head_softmax=False
+        )
+        new_token = 0
+        max_length = max_length - self.ea_layer.total_tokens - 10
+        sample_p = logits[-1].softmax(dim=-1)
+        stats['candidates'].append(draft_tokens[0, retrieve_indices].cpu().tolist())
+
+        for idx in range(max_length):
+            self.base_model.model.tree_mask = tree_mask
+
+            draft_tokens = draft_tokens.to(input_ids.device)
+            # Target model forward, get logits
+            logits, hidden_state_new, outputs = tree_decoding(
+                self,
+                draft_tokens,
+                past_key_values,
+                tree_position_ids,
+                input_ids,
+                retrieve_indices,
+            )
+            
+            draft_tokens = torch.cat((draft_tokens, padding), dim=1)
+            candidates = draft_tokens[0, retrieve_indices]
+            
+            # Apply early exit hook BEFORE evaluate_posterior to predict this round's accept length
+            # using state information from tree_decoding (logits, hidden_state_new, outputs)
+            predicted_accept_length = candidates.shape[1] - 1
+            early_exit = False
+            
+            if early_exit_hook is not None:
+                try:
+                    # Hook gets state information BEFORE verification and predicts accept length
+                    hook_state = {
+                        'mtp_module_logits': mtp_logits,
+                        'draft_candidates': candidates,
+                        'main_model_logits': logits,
+                        'main_model_hidden_state': hidden_state_new,
+                        'main_model_outputs': outputs,
+                        'step': idx,
+                        'input_ids': input_ids,
+                        'retrieve_indices': retrieve_indices,
+                        'p_token': sample_p,
+                    }
+                    predicted_accept_length = early_exit_hook(hook_state)
+                    
+                    # Ensure predicted length is valid
+                    if isinstance(predicted_accept_length, torch.Tensor):
+                        predicted_accept_length = predicted_accept_length.item()
+                    predicted_accept_length = max(0, min(predicted_accept_length, candidates.shape[1] - 1))
+                    
+                except Exception as e:
+                    print(f"Warning: early_exit_hook failed at step {idx}: {e}")
+                    print(hook_state['mtp_module_logits'].shape, 
+                        hook_state['draft_candidates'].shape, 
+                        hook_state['mtp_module_hidden_state'].shape,
+                        hook_state['retrieve_indices'],
+                        hook_state['p_token'].shape,
+                        hook_state['input_ids'].shape)
+                    predicted_accept_length = max(0, min(predicted_accept_length, candidates.shape[1] - 1))
+            
+            stats['predicted_accept_lengths'].append(predicted_accept_length)
+            
+            # Verification - get true accept length
+            best_candidate, accept_length, sample_p = evaluate_posterior(
+                logits, candidates, logits_processor
+            )
+            
+            # Record true accept length
+            true_accept_length = accept_length.item() if isinstance(accept_length, torch.Tensor) else accept_length
+            true_accept_length = min(predicted_accept_length, true_accept_length)  # For fair comparison, use min of both lengths
+            sample_p = logits[best_candidate, true_accept_length]
+            stats['true_accept_lengths'].append(true_accept_length)
+            # print(true_accept_length, torch.sigmoid(mtp_logits[:, -1]), mtp_logits.shape)
+            
+            # Use true accept length for actual generation (to maintain correctness)
+            # but record the difference for evaluation
+            # before_input_len = input_ids.shape[1]
+            input_ids, draft_tokens, retrieve_indices, tree_mask, tree_position_ids, new_token, hidden_state, sample_token, mtp_logits = update_inference_inputs(
+                input_ids,
+                candidates,
+                best_candidate,
+                true_accept_length,
+                retrieve_indices,
+                logits_processor,
+                new_token,
+                past_key_values_data,
+                current_length_data,
+                self,
+                hidden_state_new,
+                sample_p,
+                unk_head_softmax=False,
+            )
+            # after_input_len = input_ids.shape[1]
+            # print(before_input_len, after_input_len, predicted_accept_length, true_accept_length)
+            stats['candidates'].append(draft_tokens[0, retrieve_indices].cpu().tolist())
+            stats['total_steps'] += 1
+
+            if is_llama3:
+                if stop_token_id in input_ids[0, input_len:].tolist():
+                    break
+
+            if self.tokenizer.eos_token_id in input_ids[0, input_len:].tolist():
+                break
+            if new_token > max_new_tokens:
+                break
+            if input_ids.shape[1] > max_length:
+                break
+        
+        stats['total_tokens'] = new_token
+        
+        if not log:
+            return input_ids
+        else:
+            return input_ids, stats
+    
+    @torch.no_grad()
     def eagenerate_with_early_exit_hook(
         self,
         input_ids,
@@ -309,7 +500,7 @@ class EaModel(nn.Module):
             
             # Apply early exit hook BEFORE evaluate_posterior to predict this round's accept length
             # using state information from tree_decoding (logits, hidden_state_new, outputs)
-            predicted_accept_length = 0
+            predicted_accept_length = candidates.shape[1] - 1
             early_exit = False
             
             if early_exit_hook is not None:
@@ -341,9 +532,10 @@ class EaModel(nn.Module):
                         hook_state['retrieve_indices'],
                         hook_state['p_token'].shape,
                         hook_state['input_ids'].shape)
-                    predicted_accept_length = 0
+                    predicted_accept_length = candidates.shape[1] - 1
             
             stats['predicted_accept_lengths'].append(predicted_accept_length)
+            # print(predicted_accept_length)
             
             # Verification - get true accept length
             best_candidate, accept_length, sample_p = evaluate_posterior(
@@ -352,6 +544,8 @@ class EaModel(nn.Module):
             
             # Record true accept length
             true_accept_length = accept_length.item() if isinstance(accept_length, torch.Tensor) else accept_length
+            true_accept_length = min(predicted_accept_length, true_accept_length)  # For fair comparison, use min of both lengths
+            sample_p = logits[best_candidate, true_accept_length]
             stats['true_accept_lengths'].append(true_accept_length)
             
             # Use true accept length for actual generation (to maintain correctness)

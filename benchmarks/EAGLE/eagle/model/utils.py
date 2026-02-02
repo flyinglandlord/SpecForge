@@ -229,7 +229,7 @@ def initialize_tree0(input_ids, model, past_key_values, logits_processor):
     #     return draft_tokens, retrieve_indices,tree_mask,tree_position_ids, hidden_states, token
     return draft_tokens, retrieve_indices,tree_mask,tree_position_ids, logits, hidden_state, sample_token
 
-def initialize_tree(input_ids, model, past_key_values, logits_processor):
+def initialize_tree(input_ids, model, past_key_values, logits_processor, unk_head_softmax=False):
     outputs, orig, hidden_states = model(
         input_ids, past_key_values=past_key_values, output_orig=True
     )
@@ -250,7 +250,8 @@ def initialize_tree(input_ids, model, past_key_values, logits_processor):
         if outputs["hidden_states"][0].device != ea_device:
             outputs["hidden_states"] = [x.to(ea_device) for x in outputs["hidden_states"]]
         hidden_states=torch.cat(outputs["hidden_states"],dim=-1)
-    draft_tokens, retrieve_indices,tree_mask,tree_position_ids,logits = model.ea_layer.topK_genrate(hidden_states, input_ids, model.base_model.lm_head,logits_processor)
+    draft_tokens, retrieve_indices,tree_mask,tree_position_ids,logits = model.ea_layer.topK_genrate(
+        hidden_states, input_ids, model.base_model.lm_head, logits_processor, unk_head_softmax=unk_head_softmax)
     return draft_tokens, retrieve_indices,tree_mask,tree_position_ids, orig, hidden_states, token, logits
 
 
@@ -428,7 +429,8 @@ def update_inference_inputs(
         current_length_data,
         model,
         hidden_state_new,
-        sample_p
+        sample_p,
+        unk_head_softmax=False,
 ):
     prev_input_len = input_ids.shape[1]
     # Map the best candidate indices to the original indices in the sequence
@@ -465,7 +467,8 @@ def update_inference_inputs(
     # hidden_state = torch.cat((hidden_state, accept_hidden_state_new), dim=1)
     draft_tokens, retrieve_indices,tree_mask,tree_position_ids, logits = model.ea_layer.topK_genrate(accept_hidden_state_new,
                                               input_ids=torch.cat((input_ids, token.to(input_ids.device)), dim=1),
-                                              head=model.base_model.lm_head,logits_processor=logits_processor)
+                                              head=model.base_model.lm_head, logits_processor=logits_processor, 
+                                              unk_head_softmax=unk_head_softmax)
 
 
     new_token += accept_length + 1
