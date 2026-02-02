@@ -434,9 +434,9 @@ class OnlineEagle3Model(Eagle3Model):
             else:
                 avg_idk_mae = 0.0
             # 将 IDK 指标放在 acces 的最后
-            acces.append(torch.tensor(avg_idk_mae))
+            acces.append(torch.tensor(avg_idk_mae, device=acces[0].device))
         # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
-        print(acces)
+        # print(acces)
         return plosses, vlosses, acces
 
 
