@@ -26,13 +26,14 @@ def mtp_sampling_early_exit_hook(hook_state):
     K = mtp_logits.shape[0]
 
     # take UNK / exit logits: [K]
-    p_exit = torch.sigmoid(mtp_logits[:, -1])
-    probs = torch.softmax(mtp_logits[:, :-1], dim=-1)      # [K, V]
-    p_top = probs.max(dim=-1).values               # [K]
+    top1_logits = torch.max(mtp_logits[:, :-1], dim=-1).values  # [K]
+    p_exit = torch.sigmoid(mtp_logits[:, -1] - top1_logits)  # [K]
+    # probs = torch.softmax(mtp_logits[:, :-1], dim=-1)      # [K, V]
+    # p_top = probs.max(dim=-1).values               # [K]
 
     # sequential Bernoulli stopping
     for i in range(K):
-        r = p_top[i]
+        r = torch.rand((), device=p_exit.device)
         if r < p_exit[i]:
             return i  # accept i tokens, exit here
 
@@ -282,8 +283,8 @@ def main():
         dataset = load_dataset("HuggingFaceH4/mt_bench_prompts", split="train")
 
     base_model_path = "/data/chenjunyi/models/qwen3-8b"
-    baseline_eagle_path = "/data/chenjunyi/models/qwen3-8b-eagle3"
-    dynamic_eagle_path = "/data/chenjunyi/project/SpecForge/outputs/qwen3-8b-eagle3-newloss0131-dynamic-sharegpt/epoch_9_step_150840"
+    baseline_eagle_path = "/data/chenjunyi/project/SpecForge/outputs/qwen3-8b-eagle3-sharegpt/epoch_9_step_150840"
+    dynamic_eagle_path = "/data/chenjunyi/project/SpecForge/outputs/qwen3-8b-eagle3-relative-idk-dynamic-sharegpt/epoch_9_step_145000"
     # dynamic_eagle_path = "/data/chenjunyi/project/SpecForge/outputs/qwen3-8b-eagle3-newloss0131-dynamic-sharegpt/epoch_9_step_150840"
 
     tokenizer = AutoTokenizer.from_pretrained(base_model_path, use_fast=False)

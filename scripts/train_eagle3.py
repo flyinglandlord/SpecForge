@@ -174,7 +174,7 @@ def parse_args() -> Tuple[ArgumentParser, Namespace]:
     training_group.add_argument(
         "--idk-token",
         type=str,
-        default="<IDK>",
+        default=None,
         help="Special token to indicate uncertainty (used in dynamic training)",
     )
 
@@ -760,22 +760,33 @@ def record_metrcs(
     if mode == "train" and optimizer is not None:
         logdict["train/lr"] = optimizer.get_learning_rate()
 
-    accuracies = torch.stack(accuracies)
+    if len(accuracies) == args.ttt_length + 1:
+        topprob_diff = torch.stack(accuracies[-1])
+        accuracies = torch.stack(accuracies[:-1])
+    else:
+        topprob_diff = None
+        accuracies = torch.stack(accuracies)
     plosses = torch.stack(plosses)
 
-    # In case of we need to record the MSE of <IDK> in accuracies[-1]
-    # print(accuracies.shape)
     assert accuracies.shape[0] == args.ttt_length or accuracies.shape[0] == args.ttt_length + 1
 
     dist.all_reduce(accuracies, op=dist.ReduceOp.AVG)
     accuracies = accuracies.cpu().tolist()
-    for i in range(len(accuracies[:-1])):
+    for i in range(len(accuracies)):
         logdict[f"{mode}/acc_{i}"] = accuracies[i]
         print_on_rank0(
             f"Eval - Step {global_step} [{global_step + 1}/{args.num_epochs}], position {i},  Acc: {accuracies[i]:.2f}"
         )
-    if len(accuracies) == args.ttt_length + 1:
-        logdict[f"{mode}/mse_<IDK>"] = accuracies[-1]
+    
+    if topprob_diff is not None:
+        # print(topprob_diff)
+        dist.all_reduce(topprob_diff, op=dist.ReduceOp.AVG)
+        topprob_diff = topprob_diff.cpu().tolist()
+        for i in range(len(topprob_diff)):
+            logdict[f"{mode}/top1_prob_diff_{i}"] = topprob_diff[i]
+            print_on_rank0(
+                f"Eval - Step {global_step} [{global_step + 1}/{args.num_epochs}], position {i}, Top1 Prob Diff: {topprob_diff[i]:.2f}"
+            )
 
     dist.all_reduce(plosses, op=dist.ReduceOp.AVG)
     plosses = plosses.cpu().tolist()
@@ -847,6 +858,14 @@ def setup_idk_token(args, draft_model, draft_model_config):
         lm_head.out_features = draft_vocab_size + 1
         idk_index = last column
     """
+
+    if args.idk_token is None:
+        draft_model.register_buffer(
+            "idk_index",
+            None,
+            persistent=True,
+        )
+        return None
 
     lm_head = draft_model.lm_head
     assert isinstance(lm_head, nn.Linear)
@@ -1112,6 +1131,8 @@ def main():
                 time_per_step = time.time() - last_time
                 last_time = time.time()
                 avg_loss = sum(pl for pl in plosses) / len(plosses)
+                if len(acces) == args.ttt_length + 1:
+                    acces = acces[:-1]
                 avg_acc = sum(acces) / len(acces)
                 progress_bar.set_postfix(
                     {

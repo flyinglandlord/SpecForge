@@ -28,8 +28,7 @@ BUILD_DATASET_NUM_PROC=${BUILD_DATASET_NUM_PROC:-64}
 
 # Dynamic training specific settings
 TTT_LENGTH=7  # Number of draft tokens to predict
-IDK_TOKEN="<IDK>"  # Special token for uncertainty
-OUTPUT_DIR=$ROOT_DIR/outputs/qwen3-8b-eagle3-relative-idk-dynamic-sharegpt
+OUTPUT_DIR=$ROOT_DIR/outputs/qwen3-8b-eagle3-dynamic-sharegpt-loss-mode-3
 
 torchrun \
     --standalone \
@@ -50,8 +49,7 @@ torchrun \
     --tp-size $TP_SIZE \
     --target-model-backend sglang \
     --use-dynamic-length-training \
-    --idk-token $IDK_TOKEN \
     --ttt-length $TTT_LENGTH \
     --report-to wandb \
     --wandb-project dynamic_length_train \
-    --wandb-name dynamic-eagle-online-relative-idk
+    --wandb-name dynamic-eagle-online-loss-mode-3
