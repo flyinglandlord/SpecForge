@@ -152,12 +152,12 @@ def run_one_sample(
     inputs = tokenizer([text], return_tensors="pt")
 
     # ===== baseline =====
-    baseline_output_ids, stats_baseline = baseline_model.eagenerate_with_unk_head(
+    baseline_output_ids, stats_baseline = baseline_model.eagenerate_with_early_exit_hook(
         input_ids=inputs["input_ids"].to(device_baseline),
         log=True,
         max_new_tokens=max_new_tokens,
         top_k=1,
-        early_exit_hook=baseline_sampling_early_exit_hook,
+        early_exit_hook=fully_exit_hook,
     )
 
     # ===== dynamic =====
@@ -166,7 +166,7 @@ def run_one_sample(
         log=True,
         max_new_tokens=max_new_tokens,
         top_k=1,
-        early_exit_hook=mtp_sampling_early_exit_hook,
+        early_exit_hook=baseline_sampling_early_exit_hook,
     )
 
     b_ids = baseline_output_ids[0].tolist()
@@ -283,12 +283,21 @@ def main():
         dataset = load_dataset("HuggingFaceH4/mt_bench_prompts", split="train")
 
     base_model_path = "/data/chenjunyi/models/qwen3-8b"
-    baseline_eagle_path = "/data/chenjunyi/project/SpecForge/outputs/qwen3-8b-eagle3-sharegpt/epoch_9_step_150840"
-    dynamic_eagle_path = "/data/chenjunyi/project/SpecForge/outputs/qwen3-8b-eagle3-relative-idk-dynamic-sharegpt/epoch_9_step_145000"
+
+    #baseline_eagle_path = "/data/chenjunyi/project/SpecForge/outputs/qwen3-8b-eagle3-sharegpt/epoch_9_step_150840"
+    #dynamic_eagle_path = "/data/chenjunyi/project/SpecForge/outputs/qwen3-8b-eagle3-sharegpt/epoch_9_step_150840"
+
+    #baseline_eagle_path = "/data/chenjunyi/project/SpecForge/outputs/qwen3-8b-eagle3-dynamic-sharegpt-top-p-renorm/epoch_9_step_150840"
+    #dynamic_eagle_path = "/data/chenjunyi/project/SpecForge/outputs/qwen3-8b-eagle3-dynamic-sharegpt-top-p-renorm/epoch_9_step_150840"
+
+    baseline_eagle_path = "/data/chenjunyi/project/SpecForge/outputs/qwen3-8b-eagle3-dynamic-sharegpt-full-freeze-vocab/epoch_9_step_150840"
+    dynamic_eagle_path = "/data/chenjunyi/project/SpecForge/outputs/qwen3-8b-eagle3-dynamic-sharegpt-full-freeze-vocab/epoch_9_step_150840"
+
+    # dynamic_eagle_path = "/data/chenjunyi/project/SpecForge/outputs/qwen3-8b-eagle3-relative-idk-dynamic-sharegpt/epoch_9_step_145000"
     # dynamic_eagle_path = "/data/chenjunyi/project/SpecForge/outputs/qwen3-8b-eagle3-newloss0131-dynamic-sharegpt/epoch_9_step_150840"
 
     tokenizer = AutoTokenizer.from_pretrained(base_model_path, use_fast=False)
-    depth = 7
+    depth = 16
 
     # baseline_model = None
     # dynamic_model = None

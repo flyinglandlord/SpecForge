@@ -33,6 +33,7 @@ class TrackerArgs:
         parser.add_argument("--wandb-project", type=str, default=None)
         parser.add_argument("--wandb-name", type=str, default=None)
         parser.add_argument("--wandb-key", type=str, default=None, help="W&B API key.")
+        parser.add_argument("--wandb-entity", type=str, default=None, help="W&B entity.")
         # swanlab-specific args
         parser.add_argument(
             "--swanlab-project",

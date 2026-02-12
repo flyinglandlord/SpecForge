@@ -4,7 +4,7 @@ import math
 import os
 import time
 from argparse import ArgumentParser, Namespace
-from typing import List, Optional, Tuple, Union
+from typing import List, Optional, Tuple, Union, Dict
 
 import torch
 import torch.distributed as dist
@@ -176,6 +176,11 @@ def parse_args() -> Tuple[ArgumentParser, Namespace]:
         type=str,
         default=None,
         help="Special token to indicate uncertainty (used in dynamic training)",
+    )
+    training_group.add_argument(
+        "--use-main-model-lm-head",
+        action="store_true",
+        help="Whether to use the LM head from the main target model for draft model training.",
     )
 
     # data processing type
@@ -403,6 +408,13 @@ def build_draft_model(args: Namespace) -> Tuple[AutoDraftModelConfig, nn.Module]
 
     draft_model.load_embedding(args.target_model_path, embedding_key=args.embedding_key)
     draft_model.freeze_embedding()
+
+    if args.use_main_model_lm_head:
+        assert draft_model_config.draft_vocab_size == draft_model_config.vocab_size, \
+            "When using the main model LM head, the draft vocab size must match the target vocab size."
+        draft_model.load_lm_head(args.target_model_path, lm_head_key=args.lm_head_key)
+        draft_model.freeze_lm_head()
+        print_with_rank("Loaded and froze LM head from the main target model for draft model.")
 
     return draft_model_config, draft_model
 
@@ -667,7 +679,7 @@ def run_forward_dynamic_length(
     )
 
     # 4. Eagle forward with dynamic_length
-    plosses, _, acces = eagle3_model(
+    plosses, _, acces, training_details = eagle3_model(
         input_ids=input_ids,
         attention_mask=attention_mask,
         loss_mask=loss_mask,
@@ -676,7 +688,7 @@ def run_forward_dynamic_length(
         dynamic_lengths=dyn_lengths, 
     )
 
-    return plosses, acces, dyn_lengths
+    return plosses, acces, dyn_lengths, training_details
 
 def run_forward(
     args: Namespace,
@@ -722,14 +734,14 @@ def run_forward(
                 input_ids, target, loss_mask
             )
 
-        plosses, _, acces = eagle3_model(
+        plosses, _, acces, training_details = eagle3_model(
             input_ids=input_ids,
             attention_mask=attention_mask,
             loss_mask=loss_mask,
             target=target,
             hidden_states=hidden_states,
         )
-    return plosses, acces
+    return plosses, acces, training_details
 
 
 def run_backward_and_update(
@@ -753,6 +765,7 @@ def record_metrcs(
     global_step: int,
     tracker: Tracker,
     optimizer: Optional[Optimizer] = None,
+    training_details: Optional[Dict] = None,
     mode: str = "train",
 ) -> None:
     logdict = {}
@@ -760,12 +773,7 @@ def record_metrcs(
     if mode == "train" and optimizer is not None:
         logdict["train/lr"] = optimizer.get_learning_rate()
 
-    if len(accuracies) == args.ttt_length + 1:
-        topprob_diff = torch.stack(accuracies[-1])
-        accuracies = torch.stack(accuracies[:-1])
-    else:
-        topprob_diff = None
-        accuracies = torch.stack(accuracies)
+    accuracies = torch.stack(accuracies)
     plosses = torch.stack(plosses)
 
     assert accuracies.shape[0] == args.ttt_length or accuracies.shape[0] == args.ttt_length + 1
@@ -778,14 +786,37 @@ def record_metrcs(
             f"Eval - Step {global_step} [{global_step + 1}/{args.num_epochs}], position {i},  Acc: {accuracies[i]:.2f}"
         )
     
-    if topprob_diff is not None:
-        # print(topprob_diff)
+    if training_details is not None and "detail_pdiff" in training_details:
+        topprob_diff = training_details["detail_pdiff"]
+        topprob_diff = torch.stack(topprob_diff)
         dist.all_reduce(topprob_diff, op=dist.ReduceOp.AVG)
         topprob_diff = topprob_diff.cpu().tolist()
         for i in range(len(topprob_diff)):
             logdict[f"{mode}/top1_prob_diff_{i}"] = topprob_diff[i]
             print_on_rank0(
                 f"Eval - Step {global_step} [{global_step + 1}/{args.num_epochs}], position {i}, Top1 Prob Diff: {topprob_diff[i]:.2f}"
+            )
+    
+    if training_details is not None and "detail_bce_loss" in training_details:
+        bce_loss = training_details["detail_bce_loss"]
+        bce_loss = torch.stack(bce_loss)
+        dist.all_reduce(bce_loss, op=dist.ReduceOp.AVG)
+        bce_loss = bce_loss.cpu().tolist()
+        for i in range(len(bce_loss)):
+            logdict[f"{mode}/bce_loss_{i}"] = bce_loss[i]
+            print_on_rank0(
+                f"Eval - Step {global_step} [{global_step + 1}/{args.num_epochs}], position {i}, BCE Loss: {bce_loss[i]:.4f}"
+            )
+    
+    if training_details is not None and "detail_rank_loss" in training_details:
+        rank_loss = training_details["detail_rank_loss"]
+        rank_loss = torch.stack(rank_loss)
+        dist.all_reduce(rank_loss, op=dist.ReduceOp.AVG)
+        rank_loss = rank_loss.cpu().tolist()
+        for i in range(len(rank_loss)):
+            logdict[f"{mode}/rank_loss_{i}"] = rank_loss[i]
+            print_on_rank0(
+                f"Eval - Step {global_step} [{global_step + 1}/{args.num_epochs}], position {i}, Rank Loss: {rank_loss[i]:.4f}"
             )
 
     dist.all_reduce(plosses, op=dist.ReduceOp.AVG)
@@ -937,7 +968,7 @@ def setup_idk_token(args, draft_model, draft_model_config):
 
     draft_model.has_idk_head = True
 
-    print(
+    print_on_rank0(
         f"[IDK] Added <IDK> head: lm_head {old_out} → {old_out + 1}, "
         f"idk_index={idk_index}"
     )
@@ -1106,11 +1137,11 @@ def main():
             # 7.1 Training Step
             # ================================================
             if args.use_dynamic_length_training:
-                plosses, acces, dynamic_length = run_forward_dynamic_length(
+                plosses, acces, dynamic_length, training_details = run_forward_dynamic_length(
                     args, eagle3_model, data, target_model, is_online
                 )
             else:
-                plosses, acces = run_forward(
+                plosses, acces, training_details = run_forward(
                     args, eagle3_model, data, target_model, is_online
                 )
             run_backward_and_update(args, plosses, optimizer, global_step)
@@ -1124,6 +1155,7 @@ def main():
                     global_step // args.draft_accumulation_steps,
                     tracker,
                     optimizer,
+                    training_details,
                     mode="train",
                 )
 

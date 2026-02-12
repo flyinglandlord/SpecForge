@@ -130,6 +130,7 @@ class WandbTracker(Tracker):
         if self.rank == 0:
             wandb.login(key=args.wandb_key)
             wandb.init(
+                entity=args.wandb_entity,
                 project=args.wandb_project, name=args.wandb_name, config=vars(args)
             )
             self.is_initialized = True

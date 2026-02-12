@@ -10,7 +10,7 @@ from torch.distributed._tensor import DTensor, Shard, distribute_tensor
 from transformers import AutoConfig, PretrainedConfig
 
 logger = logging.getLogger(__name__)
-
+logger.setLevel(logging.INFO)
 
 @contextmanager
 def rank_0_priority():

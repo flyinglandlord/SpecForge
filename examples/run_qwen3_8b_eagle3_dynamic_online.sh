@@ -28,14 +28,14 @@ BUILD_DATASET_NUM_PROC=${BUILD_DATASET_NUM_PROC:-64}
 
 # Dynamic training specific settings
 TTT_LENGTH=7  # Number of draft tokens to predict
-OUTPUT_DIR=$ROOT_DIR/outputs/qwen3-8b-eagle3-dynamic-sharegpt-loss-mode-3
+OUTPUT_DIR=$ROOT_DIR/outputs/qwen3-8b-eagle3-dynamic-sharegpt-full-freeze-vocab-top16loss
 
 torchrun \
     --standalone \
     --nproc_per_node $NUM_GPUS \
     $ROOT_DIR/scripts/train_eagle3.py \
     --target-model-path /data/chenjunyi/models/qwen3-8b \
-    --draft-model-config $ROOT_DIR/configs/qwen3-8b-eagle3.json \
+    --draft-model-config $ROOT_DIR/configs/qwen3-8b-eagle3-full-vocab.json \
     --train-data-path $ROOT_DIR/cache/dataset/sharegpt_train.jsonl \
     --build-dataset-num-proc $BUILD_DATASET_NUM_PROC \
     --output-dir $OUTPUT_DIR \
@@ -46,10 +46,13 @@ torchrun \
     --chat-template qwen \
     --cache-dir $ROOT_DIR/cache \
     --embedding-key model.embed_tokens.weight \
+    --lm-head-key lm_head.weight \
     --tp-size $TP_SIZE \
     --target-model-backend sglang \
     --use-dynamic-length-training \
     --ttt-length $TTT_LENGTH \
     --report-to wandb \
-    --wandb-project dynamic_length_train \
-    --wandb-name dynamic-eagle-online-loss-mode-3
+    --wandb-project DEAGLE-train \
+    --wandb-name SoftCE_Top16Loss_FullFreezeVocab_sharegpt_dynamic_ttt7 \
+    --wandb-entity junyi-chen-sjtu \
+    --use-main-model-lm-head

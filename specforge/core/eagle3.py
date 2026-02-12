@@ -20,7 +20,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Dict, Any
 
 import torch
 import torch.nn as nn
@@ -90,38 +90,25 @@ class OnlineEagle3Model(Eagle3Model):
         return shared_input
 
     # ================= LOSS FUNCTIONS =================
-    def _compute_loss_1_soft_bce(self, logits, target_probs, mask):
-        """
-        Loss 1: BCE on Softmax Probabilities
-        Formula: - [ (1 - p_main) * log(1 - p_draft) + p_main * log(p_draft) ]
-        注意: 这里必须先做 Softmax，不能用 ..with_logits (它是 Sigmoid)
-        """
-        # 1. 显式做 Softmax，获取模型认为的概率分布
-        draft_probs_all = F.softmax(logits, dim=-1) # [B, S, V]
+    def _compute_loss_1_topk_soft_ce(self, logits, target_probs, mask, k=16):
+        # 1. 获取 Main Model (Teacher) 的 Top-K
+        teacher_topk_probs, teacher_topk_indices = torch.topk(target_probs, k=k, dim=-1)
         
-        # 2. 找到 Target Token 的索引
-        target_indices = target_probs.argmax(dim=-1).unsqueeze(-1) # [B, S, 1]
+        # 2. 获取 Draft Model 的 Log Probabilities
+        draft_log_probs_all = F.log_softmax(logits, dim=-1) # [B, S, V]
         
-        # 3. 取出 Draft 对 Target 位置预测的 Softmax 概率
-        draft_p_target = draft_probs_all.gather(dim=-1, index=target_indices) # [B, S, 1]
+        # 3. Gather Draft 在 Teacher 关注的那 K 个位置的 Log Probs
+        draft_log_probs_topk = draft_log_probs_all.gather(dim=-1, index=teacher_topk_indices) # [B, S, K]
         
-        # 4. 取出 Main (Soft Label) 对 Target 位置的概率
-        main_p_target = target_probs.gather(dim=-1, index=target_indices)     # [B, S, 1]
+        # 4. 计算 Partial Cross Entropy: - Sum( P_teacher_raw * log P_student )
+        loss_per_token = -torch.sum(teacher_topk_probs * draft_log_probs_topk, dim=-1) # [B, S]
         
-        # 5. 手动计算 binary_cross_entropy
-        # 输入必须都在 [0, 1] 之间。为了数值稳定，可以加个 eps
-        eps = 1e-8
-        draft_p_target = torch.clamp(draft_p_target, eps, 1.0 - eps)
+        # 5. Mask Mean
+        if mask.dim() == 3: mask = mask.squeeze(-1)
+        loss = (loss_per_token * mask).sum() / (mask.sum() + 1e-8)
         
-        loss_raw = F.binary_cross_entropy(
-            draft_p_target.to(torch.bfloat16), 
-            main_p_target.to(torch.bfloat16), 
-            reduction='none'
-        )
-        
-        loss = (loss_raw * mask).sum() / (mask.sum() + 1e-8)
         return loss
-
+    
     def _compute_loss_3_ranking(self, logits, target_probs, mask):
         """
         Loss 3: Ranking
@@ -142,14 +129,6 @@ class OnlineEagle3Model(Eagle3Model):
         
         loss = (loss_raw * mask).sum() / (mask.sum() + 1e-8)
         return loss
-    
-    def _compute_loss_2_combined(self, logits, target_probs, mask):
-        """
-        Loss 2: 结合 Loss 1 (数值对齐) 和 Loss 3 (排序对齐)。
-        """
-        l1 = self._compute_loss_1_soft_bce(logits, target_probs, mask)
-        l3 = self._compute_loss_3_ranking(logits, target_probs, mask)
-        return l1 + l3
 
     def _compute_loss_4_sigmoid_contrastive(self, logits, target_probs, mask):
         """
@@ -175,6 +154,53 @@ class OnlineEagle3Model(Eagle3Model):
         term_others = - (sum_log_inv - log_inv_target) / (logits.size(-1) - 1)
         
         loss = ((term_target + term_others) * mask).sum() / (mask.sum() + 1e-8)
+        return loss
+
+    def _compute_loss_top_p_renorm_ce(self, logits, target_probs, mask, top_p=0.9, max_k_search=256):
+        """
+        Component 1: Top-P Renormalized Soft Cross Entropy
+        只关注 Teacher 认为靠谱的 Token，忽略尾部噪声。
+        """
+        B, S, V = target_probs.shape
+    
+        # 1. 只取 Top-K 值和索引，避免对 128k 词表进行全排序
+        # max_k_search 设为 128 或 256 足够覆盖 0.9 的概率质量
+        # memory usage: O(B*S*K) vs O(B*S*V)
+        top_k_probs, top_k_indices = torch.topk(target_probs, k=min(max_k_search, V), dim=-1) # [B, S, K]
+        
+        # 2. 在 K 的维度上计算累积概率
+        cumulative_probs = torch.cumsum(top_k_probs, dim=-1)
+        
+        # 3. 生成 Mask (逻辑同原代码，只是在 K 维度操作)
+        sorted_indices_to_remove = cumulative_probs > top_p
+        # shift right to keep the first token that crosses the threshold
+        sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
+        sorted_indices_to_remove[..., 0] = 0
+        
+        # 4. 重新归一化 (只在这个 Top-K 的子集上操作)
+        # 既然我们已经放弃了 K 以外的词，逻辑上：
+        # valid_probs = top_k_probs * (~remove_mask)
+        top_k_probs_clean = top_k_probs.masked_fill(sorted_indices_to_remove, 0.0)
+        
+        # 计算归一化因子
+        normalization_factor = top_k_probs_clean.sum(dim=-1, keepdim=True) + 1e-8
+        target_probs_renorm_small = top_k_probs_clean / normalization_factor # [B, S, K]
+        
+        # 5. 计算 Loss: 只需取出 Logits 对应的 Top-K 位置
+        # 这样避免了构建一个巨大的 Full Vocab Mask
+        log_probs = F.log_softmax(logits, dim=-1) # [B, S, V]
+        
+        # Gather draft log_probs at top_k indices
+        # index 维度必须和 output 维度匹配，所以用 top_k_indices
+        log_probs_gathered = log_probs.gather(dim=-1, index=top_k_indices) # [B, S, K]
+        
+        # 计算 Cross Entropy: - sum( P_small * log Q_small )
+        loss_per_token = -torch.sum(target_probs_renorm_small * log_probs_gathered, dim=-1) # [B, S]
+        
+        # 6. Mask Mean
+        if mask.dim() == 3: mask = mask.squeeze(-1)
+        loss = (loss_per_token * mask).sum() / (mask.sum() + 1e-8)
+        
         return loss
 
     # ================ DYNAMIC LENGTH HANDLING =================
@@ -280,18 +306,16 @@ class OnlineEagle3Model(Eagle3Model):
         past_key_values: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         position_ids: Optional[torch.Tensor] = None,
         **kwargs,
-    ) -> Tuple[List[torch.Tensor], List[torch.Tensor], List[torch.Tensor]]:
+    ) -> Tuple[List[torch.Tensor], List[torch.Tensor], List[torch.Tensor], Dict[str, Any]]:
         """
-        Online eagle model trainer, modified from: https://github.com/SafeAILab/EAGLE/blob/main/eagle/traineagle3/cnets.py#L711
+        Online eagle model trainer with detailed logging.
 
-        Args:
-            input_ids: (batch, seq_len)
-            attention_mask: (batch, seq_len)
-            loss_mask: (batch, seq_len)
-            past_key_values: We dont use this past_key_values in eagle3, but keep it for compatibility. We control kvcache by cache_hidden.
-            position_ids: (batch, seq_len)
+        Returns:
+            plosses: list of total losses per step (for backward)
+            vlosses: empty list (legacy compatibility)
+            acces: list of accuracies per step
+            training_details: Dict containing detailed metrics (bce_loss, rank_loss, pdiff, etc.)
         """
-        # print("forward dynamic length:", input_ids.shape, attention_mask.shape, loss_mask.shape)
         # Step 1: handle vocab size
         target_p_padded, position_mask = _compute_target_p_padded(
             target=target,
@@ -302,17 +326,16 @@ class OnlineEagle3Model(Eagle3Model):
         del target
         dynamic_lengths = kwargs.get("dynamic_lengths", None)
         use_dynamic_training = dynamic_lengths is not None
-        # print(self.draft_model.idk_index, dynamic_lengths, use_idk)
 
         # basic info
         batch_size, seq_length, _ = hidden_states.shape
         seq_length_with_past = seq_length
         past_key_values_length = 0
 
-        # Step 2: project the concatenated hidden states to the target hidden size
+        # Step 2: project hidden states
         hidden_states = self.draft_model.project_hidden_states(hidden_states)
 
-        # Step 3: process kv cache, position ids and position ids
+        # Step 3: process kv cache, position ids
         if past_key_values is not None:
             past_key_values_length = past_key_values[0][0].shape[2]
             seq_length_with_past = seq_length_with_past + past_key_values_length
@@ -345,13 +368,18 @@ class OnlineEagle3Model(Eagle3Model):
             )
 
         # Step 5: run TTT
-        plosses = []
+        plosses = []  # Total loss (variables with grad)
         vlosses = []
         acces = []
-        pdiffs = []
 
-        # for sequence paralle, position mask and input ids will split by sequence dim, need to keep origin for ttt shift
+        # --- New: Detailed Metrics Lists ---
+        det_bce_losses = []
+        det_rank_losses = []
+        det_pdiffs = []
+
         global_input_ids = input_ids
+        
+        # Init Cache based on backend
         if self.attention_backend in ["sdpa", "fa"]:
             cache_hidden = [[], []]
             past_key_values = None
@@ -368,9 +396,8 @@ class OnlineEagle3Model(Eagle3Model):
         for idx in range(self.length):
             target_p = target_p_padded[:, idx : idx + seq_length, :]
 
-            # <<<<<<<<<<<<<< KEY CHANGE: Call fix_target_p_dynamic >>>>
             if use_dynamic_training:
-                # 使用封装好的函数生成 Mask，不再修改 target_p
+                # Generate Mask based on dynamic lengths
                 _, dynamic_mask = self.fix_target_p_dynamic(
                     target_p=target_p,
                     dynamic_lengths=dynamic_lengths,
@@ -379,7 +406,6 @@ class OnlineEagle3Model(Eagle3Model):
                 current_position_mask = position_mask * dynamic_mask
             else:
                 current_position_mask = position_mask
-            # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
 
             if self.attention_backend == "usp":
                 input_ids = self.prepare_usp_input(global_input_ids)
@@ -388,11 +414,11 @@ class OnlineEagle3Model(Eagle3Model):
 
             is_last = idx == self.length - 1
 
-            # Step 5.1: embed the input ids
+            # Step 5.1: embed
             inputs_embeds = self.draft_model.embed_input_ids(input_ids)
             inputs_embeds = inputs_embeds.to(hidden_states.dtype)
 
-            # Step 5.2: run the draft model backbone
+            # Step 5.2: backbone
             hidden_states_out = self.draft_model.backbone(
                 input_embeds=inputs_embeds,
                 hidden_states=hidden_states,
@@ -403,39 +429,29 @@ class OnlineEagle3Model(Eagle3Model):
                 use_cache=True,
             )
 
-            # update hidden states for next step
             hidden_states = hidden_states_out
 
             # Step 5.4: get logits
             logits = self.draft_model.compute_logits(hidden_states)
             logits = gather_outputs_and_unpad(logits, gather_dim=1)
 
-            # 准备 Mask: Valid Mask (Padding + Dynamic Truncation)
-            valid_mask = current_position_mask.squeeze(-1) * loss_mask.squeeze(-1) # [B, S]
-            valid_mask = valid_mask.unsqueeze(-1) # [B, S, 1]
-
             if use_dynamic_training:
-                # Option 1: Soft BCE (数值拟合)
-                # loss = self._compute_loss_1_soft_bce(logits, target_p, valid_mask)
+                loss_bce = self._compute_loss_1_topk_soft_ce(logits, target_p, current_position_mask, k=16)
+                loss_rank = self._compute_loss_3_ranking(logits, target_p, current_position_mask)
                 
-                # Option 2: Combined (数值 + 排序)
-                # loss = self._compute_loss_2_combined(logits, target_p, valid_mask)
+                # 3. 总 Loss (用于反向传播)
+                loss = loss_bce + loss_rank
                 
-                # Option 3: Ranking Only (排序拟合)
-                loss = self._compute_loss_3_ranking(logits, target_p, valid_mask)
-                
-                # Option 4: Sigmoid Contrastive (独立二分类)
-                # loss = self._compute_loss_4_sigmoid_contrastive(logits, target_p, valid_mask)
-                
-                # Default (Baseline): Standard CE with dynamic mask
-                # loss = LogSoftmaxLoss.apply(logits, target_p, current_position_mask)
+                with torch.no_grad():
+                    det_bce_losses.append(loss_bce.clone().detach())
+                    det_rank_losses.append(loss_rank.clone().detach())
             else:
-                # Standard Training (Original Eagle Behavior)
+                # Standard Legacy Training
                 loss = LogSoftmaxLoss.apply(logits, target_p, position_mask)
 
             plosses.append(loss)
 
-            # Step 5.5: record metrics first as we in-place modify logits
+            # Step 5.5: record metrics
             with torch.no_grad():
                 acces.append(
                     _compute_metric_acc(
@@ -445,24 +461,30 @@ class OnlineEagle3Model(Eagle3Model):
                         loss_mask=loss_mask,
                     )
                 )
-                pdiffs.append(
+                det_pdiffs.append(
                     _compute_top_prob_diff(
                         logits=logits,
                         target_p=target_p,
-                        valid_mask=valid_mask
+                        valid_mask=current_position_mask
                     )
                 )
 
             if not is_last:
-                # Step 5.7: we need to update the loss mask
                 global_input_ids = padding(global_input_ids, left=False)
                 position_mask = padding(position_mask, left=False)
                 loss_mask = padding(loss_mask, left=False)
-                # Flex attention mask shirnking is handled inside attention module
 
-        acces.append(pdiffs)
+        # 构造返回字典
+        training_details = {}
+        if use_dynamic_training:
+            if len(det_bce_losses) > 0:
+                training_details["detail_bce_loss"] = det_bce_losses
+            if len(det_rank_losses) > 0:
+                training_details["detail_rank_loss"] = det_rank_losses
+            training_details["dynamic_lengths"] = dynamic_lengths
+        training_details["detail_pdiff"] = det_pdiffs
         
-        return plosses, vlosses, acces
+        return plosses, vlosses, acces, training_details
 
 
 class QwenVLOnlineEagle3Model(Eagle3Model):

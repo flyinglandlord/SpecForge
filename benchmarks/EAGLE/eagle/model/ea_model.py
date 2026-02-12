@@ -76,11 +76,12 @@ class EaModel(nn.Module):
         
         # fix the incompatible d2t and t2d keys when vocab size changes
         # d2t: add a new item for <IDK> token, make length from 32000 to 32001
-        if ea_layer_state_dict['d2t'].shape[0] != self.ea_layer.d2t.shape[0]:
-            ea_layer_state_dict['d2t'] = nn.Parameter(torch.cat(
-                [ea_layer_state_dict['d2t'], torch.zeros(1).to(ea_layer_state_dict['d2t'].device)],
-                dim=0
-            ))
+        if config.vocab_size != config.draft_vocab_size:
+            if ea_layer_state_dict['d2t'].shape[0] != self.ea_layer.d2t.shape[0]:
+                ea_layer_state_dict['d2t'] = nn.Parameter(torch.cat(
+                    [ea_layer_state_dict['d2t'], torch.zeros(1).to(ea_layer_state_dict['d2t'].device)],
+                    dim=0
+                ))
 
         load_=self.ea_layer.load_state_dict(ea_layer_state_dict, strict=False)
         self.ea_layer.to(self.base_model.dtype).to(device)
